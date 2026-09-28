@@ -115,9 +115,11 @@ func (tor *Torrent) populateMetaInfo(raw map[string]any) error {
 					slog.Warn("announce-list url is not a string, skipping", "tier", i)
 				}
 			}
-			mi.announceList = append(mi.announceList, tierCounter)
+			if len(tierCounter) > 0 {
+				mi.announceList = append(mi.announceList, tierCounter)
+			}
 		}
-		slog.Debug("parsed announce-list", "tiers", len(mi.announceList))
+		slog.Info("parsed announce-list", "tiers", len(mi.announceList))
 	}
 
 	if createdRaw, ok := raw["creation date"].(int64); ok {
