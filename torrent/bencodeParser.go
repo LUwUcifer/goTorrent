@@ -231,11 +231,7 @@ func parseSingleFileInfo(raw map[string]any) (singleFileInfo, error) {
 	}
 	sf.length = length
 
-	if md5Raw, ok := raw["md5sum"].(string); ok {
-		copy(sf.md5sum[:], md5Raw)
-	} else {
-		slog.Debug("md5sum not provided, skipping", "name", name)
-	}
+	sf.md5sum, _ = parseMD5(raw, "name", name)
 
 	slog.Info("parsed single-file info", "name", sf.name, "length", sf.length)
 	return sf, nil
@@ -269,11 +265,7 @@ func parseMultiFileInfo(raw map[string]any, filesRaw []any) (multFileInfo, error
 		}
 		f.length = length
 
-		if md5Raw, ok := fileEntry["md5sum"].(string); ok {
-			copy(f.md5sum[:], md5Raw)
-		} else {
-			slog.Debug("md5sum not provided for file, skipping", "index", i)
-		}
+		f.md5sum, _ = parseMD5(fileEntry, "index", i)
 
 		if pathRaw, ok := fileEntry["path"].([]any); ok {
 			for _, p := range pathRaw {

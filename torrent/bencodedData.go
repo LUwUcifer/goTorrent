@@ -14,6 +14,8 @@ type metaInfo struct {
 }
 
 type hashBytes = [20]byte
+type md5Hex = [32]byte
+
 type infoDict struct {
 	pieceLength int64
 	pieces      []hashBytes
@@ -27,12 +29,12 @@ type infoDict struct {
 type singleFileInfo struct {
 	name   string
 	length int64
-	md5sum [16]byte
+	md5sum md5Hex
 }
 
 type multFileFiles struct {
 	length int64
-	md5sum [32]byte
+	md5sum md5Hex
 	path   []string
 }
 type multFileInfo struct {
