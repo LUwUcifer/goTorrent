@@ -6,6 +6,7 @@ type Torrent struct {
 	torrName string
 
 	localData metaInfo
+	layout    layout
 }
 
 func NewTorrent() *Torrent {

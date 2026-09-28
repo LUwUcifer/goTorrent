@@ -55,6 +55,7 @@ func (tor *Torrent) populateTorrentPath(path, dest string) error {
 func (tor *Torrent) torrentFilePopulator() error {
 	path := tor.torrPath
 	torrentName := tor.torrName
+
 	torrentFileData, err := os.ReadFile(path)
 	if err != nil {
 		slog.Error("Error reading torrent file", "name", torrentName, "error", err)
@@ -67,13 +68,9 @@ func (tor *Torrent) torrentFilePopulator() error {
 		slog.Error("Error decoding torrent file", "name", torrentName, "error", err)
 		return err
 	}
-
-	infoBytes, ok := dec.InfoBytes()
-	if !ok {
-		return errors.New("torrent has no info dictionary")
+	if n := dec.Remaining(); n != 0 {
+		slog.Warn("trailing data after torrent dictionary", "name", torrentName, "bytes", n)
 	}
-	infoHash := sha1.Sum(infoBytes)
-	tor.localData.infoHash = infoHash
 
 	metaInfoMap, ok := decoded.(map[string]any)
 	if !ok {
@@ -82,17 +79,26 @@ func (tor *Torrent) torrentFilePopulator() error {
 		return err
 	}
 
-	if err := tor.populateMetaInfo(metaInfoMap); err != nil {
+	infoBytes, ok := dec.InfoBytes()
+	if !ok {
+		err := errors.New("error decoding torrent file: no info dictionary")
+		slog.Error(err.Error(), "name", torrentName)
+		return err
+	}
+	infoHash := sha1.Sum(infoBytes)
+
+	if err := tor.populateMetaInfo(metaInfoMap, infoHash); err != nil {
 		slog.Error("Error populating torrent file", "name", torrentName, "error", err)
 		return err
 	}
 	return nil
 }
 
-func (tor *Torrent) populateMetaInfo(raw map[string]any) error {
+func (tor *Torrent) populateMetaInfo(raw map[string]any, infoHash hashBytes) error {
 	slog.Debug("populating meta info", "keys", len(raw))
 
 	var mi metaInfo
+	mi.infoHash = infoHash
 
 	if announce, ok := raw["announce"].(string); ok {
 		mi.announce = announce
@@ -115,11 +121,13 @@ func (tor *Torrent) populateMetaInfo(raw map[string]any) error {
 					slog.Warn("announce-list url is not a string, skipping", "tier", i)
 				}
 			}
-			if len(tierCounter) > 0 {
-				mi.announceList = append(mi.announceList, tierCounter)
+			if len(tierCounter) == 0 {
+				slog.Warn("announce-list tier has no usable urls, skipping", "index", i)
+				continue
 			}
+			mi.announceList = append(mi.announceList, tierCounter)
 		}
-		slog.Info("parsed announce-list", "tiers", len(mi.announceList))
+		slog.Debug("parsed announce-list", "tiers", len(mi.announceList))
 	}
 
 	if createdRaw, ok := raw["creation date"].(int64); ok {
@@ -151,8 +159,22 @@ func (tor *Torrent) populateMetaInfo(raw map[string]any) error {
 	}
 	mi.infoDict = info
 
+	lay, err := buildLayout(info)
+	if err != nil {
+		slog.Error("invalid torrent layout", "error", err)
+		return err
+	}
+
 	tor.localData = mi
-	slog.Info("meta info populated", "announce", mi.announce, "multipleFiles", info.multipleFiles)
+	tor.layout = lay
+	slog.Info("meta info populated",
+		"announce", mi.announce,
+		"infoHash", fmt.Sprintf("%x", mi.infoHash[:]),
+		"multipleFiles", info.multipleFiles,
+		"files", len(lay.files),
+		"totalLength", lay.totalLength,
+		"pieces", lay.numPieces,
+	)
 	return nil
 }
 
@@ -178,6 +200,7 @@ func parseInfoDict(raw map[string]any) (infoDict, error) {
 		slog.Error("pieces length is not a multiple of 20", "length", len(pieceBytes))
 		return info, errors.New("pieces length is not a multiple of 20")
 	}
+	info.pieces = make([]hashBytes, 0, len(pieceBytes)/20)
 	for i := 0; i < len(pieceBytes); i += 20 {
 		var h hashBytes
 		copy(h[:], pieceBytes[i:i+20])
@@ -233,6 +256,7 @@ func parseSingleFileInfo(raw map[string]any) (singleFileInfo, error) {
 	}
 	sf.length = length
 
+	// Optional; the zero value means "not provided".
 	sf.md5sum, _ = parseMD5(raw, "name", name)
 
 	slog.Info("parsed single-file info", "name", sf.name, "length", sf.length)
@@ -251,34 +275,41 @@ func parseMultiFileInfo(raw map[string]any, filesRaw []any) (multFileInfo, error
 	}
 	mf.name = name
 
+	mf.files = make([]multFileFiles, 0, len(filesRaw))
 	for i, fileEntryRaw := range filesRaw {
-		fileEntry, ok := fileEntryRaw.(map[string]any)
+		// Skipping a bad entry would shift the offset of every later file
+		// and silently corrupt the download, so any malformed entry is fatal.
+		entry, ok := fileEntryRaw.(map[string]any)
 		if !ok {
-			slog.Warn("file entry is not a dictionary, skipping", "index", i)
-			continue
+			slog.Error("file entry is not a dictionary", "index", i)
+			return mf, fmt.Errorf("file entry %d is not a dictionary", i)
 		}
 
 		var f multFileFiles
 
-		length, ok := fileEntry["length"].(int64)
+		length, ok := entry["length"].(int64)
 		if !ok {
 			slog.Error("missing or invalid file length", "index", i)
-			return mf, errors.New("missing or invalid file length")
+			return mf, fmt.Errorf("missing or invalid length for file %d", i)
 		}
 		f.length = length
 
-		f.md5sum, _ = parseMD5(fileEntry, "index", i)
+		// Optional; the zero value means "not provided".
+		f.md5sum, _ = parseMD5(entry, "index", i)
 
-		if pathRaw, ok := fileEntry["path"].([]any); ok {
-			for _, p := range pathRaw {
-				if s, ok := p.(string); ok {
-					f.path = append(f.path, s)
-				} else {
-					slog.Warn("path segment is not a string, skipping", "index", i)
-				}
+		pathRaw, ok := entry["path"].([]any)
+		if !ok {
+			slog.Error("file entry missing path", "index", i)
+			return mf, fmt.Errorf("missing or invalid path for file %d", i)
+		}
+		for _, p := range pathRaw {
+			s, ok := p.(string)
+			if !ok {
+				// Dropping a segment would change where the file lands.
+				slog.Error("path segment is not a string", "index", i)
+				return mf, fmt.Errorf("non-string path segment in file %d", i)
 			}
-		} else {
-			slog.Warn("file entry missing path", "index", i)
+			f.path = append(f.path, s)
 		}
 
 		mf.files = append(mf.files, f)
