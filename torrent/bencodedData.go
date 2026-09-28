@@ -4,6 +4,7 @@ import "time"
 
 type metaInfo struct {
 	infoDict     infoDict
+	infoHash     [20]byte
 	announce     string
 	announceList [][]string
 	creationDate time.Time

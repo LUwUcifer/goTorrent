@@ -1,6 +1,7 @@
 package torrent
 
 import (
+	"crypto/sha1"
 	"errors"
 	"fmt"
 	"goTor/bencoder"
@@ -54,23 +55,25 @@ func (tor *Torrent) populateTorrentPath(path, dest string) error {
 func (tor *Torrent) torrentFilePopulator() error {
 	path := tor.torrPath
 	torrentName := tor.torrName
-	torrentFileReader, err := os.Open(path)
+	torrentFileData, err := os.ReadFile(path)
 	if err != nil {
-		slog.Error("Error opening torrent file", "name", torrentName, "error", err)
+		slog.Error("Error reading torrent file", "name", torrentName, "error", err)
 		return err
 	}
-	defer func(torrentFileReader *os.File) {
-		err := torrentFileReader.Close()
-		if err != nil {
-			slog.Warn(err.Error(), "name", torrentName)
-		}
-	}(torrentFileReader)
 
-	decoded, err := bencoder.NewDecoder(torrentFileReader).Decode()
+	dec := bencoder.NewDecoderBytes(torrentFileData)
+	decoded, err := dec.Decode()
 	if err != nil {
 		slog.Error("Error decoding torrent file", "name", torrentName, "error", err)
 		return err
 	}
+
+	infoBytes, ok := dec.InfoBytes()
+	if !ok {
+		return errors.New("torrent has no info dictionary")
+	}
+	infoHash := sha1.Sum(infoBytes)
+	tor.localData.infoHash = infoHash
 
 	metaInfoMap, ok := decoded.(map[string]any)
 	if !ok {
