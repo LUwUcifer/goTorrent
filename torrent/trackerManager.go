@@ -78,14 +78,11 @@ func buildTiers(lists [][]string) [][]tracker.Tracker {
 		var tier []tracker.Tracker
 		for _, raw := range urls {
 			tr, err := tracker.New(raw)
-			switch {
-			case errors.Is(err, tracker.ErrUnsupportedScheme):
-				slog.Warn("skipping tracker", "tier", ti, "reason", err)
-			case err != nil:
-				slog.Warn("skipping tracker with invalid URL", "tier", ti)
-			default:
-				tier = append(tier, tr)
+			if err != nil {
+				slog.Warn("skipping tracker", "tier", ti, "error", err)
+				continue
 			}
+			tier = append(tier, tr)
 		}
 		if len(tier) == 0 {
 			continue

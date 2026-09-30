@@ -132,7 +132,7 @@ func register(scheme string, c constructor) {
 func New(rawURL string) (Tracker, error) {
 	u, err := url.Parse(strings.TrimSpace(rawURL))
 	if err != nil {
-		return nil, fmt.Errorf("tracker: parsing %q: %w", rawURL, err)
+		return nil, fmt.Errorf("tracker: invalid announce URL: %w", stripURLError(err))
 	}
 
 	c, ok := constructors[u.Scheme]
@@ -140,7 +140,7 @@ func New(rawURL string) (Tracker, error) {
 		return nil, fmt.Errorf("%w: %q", ErrUnsupportedScheme, u.Scheme)
 	}
 	if u.Host == "" {
-		return nil, fmt.Errorf("tracker: %q has no host", rawURL)
+		return nil, errors.New("tracker: announce URL has no host")
 	}
 	return c(u)
 }
