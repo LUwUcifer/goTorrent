@@ -95,6 +95,7 @@ type AnnounceResponse struct {
 const (
 	defaultInterval     = 30 * time.Minute
 	minAnnounceInterval = 30 * time.Second
+	maxAnnounceInterval = 24 * time.Hour
 )
 
 func (r AnnounceResponse) NextAnnounce() time.Duration {
@@ -107,6 +108,9 @@ func (r AnnounceResponse) NextAnnounce() time.Duration {
 	}
 	if d < minAnnounceInterval {
 		d = minAnnounceInterval
+	}
+	if d > maxAnnounceInterval {
+		d = maxAnnounceInterval
 	}
 	return d
 }

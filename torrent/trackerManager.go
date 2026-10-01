@@ -56,6 +56,8 @@ func newTrackerManager(tor *Torrent, c *Client) (*trackerManager, error) {
 		kick:       make(chan struct{}, 1),
 	}
 
+	m.sentCompleted = tor.bytesLeft() == 0
+
 	m.tiers = buildTiers(mi.announceList)
 	if len(m.tiers) == 0 && mi.announce != "" {
 		m.tiers = buildTiers([][]string{{mi.announce}})
@@ -165,7 +167,8 @@ func (m *trackerManager) run(ctx context.Context) {
 		if len(resp.Peers) > 0 {
 			select {
 			case m.tor.peerCh <- resp.Peers:
-			case <-ctx.Done():
+			default:
+				slog.Debug("peer channel full, dropping batch", "peers", len(resp.Peers))
 			}
 		}
 

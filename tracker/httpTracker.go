@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"goTor/bencoder"
 	"io"
+	"log/slog"
 	"math"
 	"net/http"
 	"net/netip"
@@ -64,7 +65,7 @@ func (t *httpTracker) Announce(ctx context.Context, req AnnounceRequest) (Announ
 	defer func(Body io.ReadCloser) {
 		err := Body.Close()
 		if err != nil {
-			fmt.Printf("tracker: announce to %s failed: %v\n", t.display, err)
+			slog.Debug("closing response body", "tracker", t.display, "error", err)
 		}
 	}(resp.Body)
 

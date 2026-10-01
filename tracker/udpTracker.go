@@ -73,7 +73,7 @@ func (t *udpTracker) Announce(ctx context.Context, req AnnounceRequest) (Announc
 	defer func(conn net.Conn) {
 		err := conn.Close()
 		if err != nil {
-			slog.Debug("tracker: closing connection to %s: %v", t.display, err)
+			slog.Debug("closing connection", "tracker", t.display, "error", err)
 		}
 	}(conn)
 
