@@ -17,6 +17,7 @@ var (
 	ErrBufferFull = errors.New("piece: assembly buffer full")
 )
 
+// pieceWriter is where verified pieces go. *Storage implements it.
 type pieceWriter interface {
 	WritePieceAt(p []byte, index int, begin int64) (int, error)
 }
@@ -236,24 +237,38 @@ func (a *pieceAssembler) Done() bool {
 	return a.CompleteCount() == a.lay.numPieces
 }
 
-func (a *pieceAssembler) MarkComplete(index int) {
+func (a *pieceAssembler) MarkComplete(index int) bool {
 	if index < 0 || index >= a.lay.numPieces {
-		return
+		return false
 	}
 	a.mu.Lock()
 	defer a.mu.Unlock()
 
 	if a.complete[index] {
-		return
+		return false
 	}
 	if pp := a.parts[index]; pp != nil {
 		if pp.verifying {
-			return
+			return false
 		}
 		a.dropLocked(index, pp)
 	}
 	a.complete[index] = true
 	a.completeCount++
+	return true
+}
+
+func (a *pieceAssembler) BitfieldBytes() []byte {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+
+	out := make([]byte, (a.lay.numPieces+7)/8)
+	for i, ok := range a.complete {
+		if ok {
+			out[i/8] |= 0x80 >> (i % 8)
+		}
+	}
+	return out
 }
 
 func (a *pieceAssembler) MissingBlocks(index int) []int {
