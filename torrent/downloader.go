@@ -6,6 +6,7 @@ import (
 	"log/slog"
 	"net/netip"
 	"runtime"
+	"slices"
 	"sync"
 	"time"
 
@@ -18,6 +19,7 @@ const (
 	maxUnsolicited = 256 // blocks we never asked for (or cancelled) before dropping a peer
 	bufferPause    = time.Second
 	storagePause   = 5 * time.Second
+	maxCancelled   = 1024 // remembered cancelled requests per peer
 )
 
 type downloaderConfig struct {
@@ -40,6 +42,16 @@ type downloaderConfig struct {
 	// MaxStrikes is how many suspected-corruption strikes get an address
 	// banned. A piece with a single source bans it outright.
 	MaxStrikes int
+
+	// EndgameBlocks is the number of missing blocks at or below which, once
+	// every remaining piece is already assigned, idle peers also request
+	// blocks that other peers are fetching. 0 means 32; negative disables
+	// endgame mode.
+	EndgameBlocks int
+
+	// EndgameMaxRequesters caps how many peers may request one block at the
+	// same time. 0 means 3.
+	EndgameMaxRequesters int
 
 	Tick    time.Duration // how often timeouts are checked
 	Workers int           // goroutines hashing and writing completed pieces
@@ -66,6 +78,12 @@ func (c downloaderConfig) withDefaults() downloaderConfig {
 	}
 	if c.Workers <= 0 {
 		c.Workers = min(runtime.NumCPU(), 4)
+	}
+	if c.EndgameBlocks == 0 {
+		c.EndgameBlocks = 32
+	}
+	if c.EndgameMaxRequesters <= 0 {
+		c.EndgameMaxRequesters = 3
 	}
 	return c
 }
@@ -97,6 +115,10 @@ type dlPeer struct {
 	unsolicited  int
 	snubbedUntil time.Time
 	dead         bool
+
+	// cancelled remembers requests we withdrew, with their length, so a block
+	// already on the wire when the cancel went out is accepted, not punished.
+	cancelled map[reqKey]uint32
 }
 
 type blockJob struct {
@@ -141,6 +163,10 @@ type downloader struct {
 	peers       map[*peer.Peer]*dlPeer
 	pausedUntil time.Time // no new pieces are assigned before this
 	strikes     map[netip.Addr]int
+
+	endgame     bool  // idle peers may duplicate other peers' requests
+	endgameSeen bool  // endgame has been on at some point: duplicates may exist
+	tail        []int // unverified pieces, cached while few remain
 
 	banMu  sync.RWMutex
 	banned map[netip.Addr]struct{}
@@ -299,22 +325,40 @@ func (d *downloader) onEvent(ev peer.Event) {
 
 func (d *downloader) onBlock(dp *dlPeer, pc peer.Piece) {
 	k := reqKey{pc.Index, pc.Begin}
-	req, ok := dp.inflight[k]
-	if !ok {
-		// Late answer to something we cancelled, or never asked for.
+
+	var want uint32
+	answered := false
+	if req, ok := dp.inflight[k]; ok {
+		want, answered = req.length, true
+	} else if n, ok := dp.cancelled[k]; ok {
+		// We withdrew this request (a stall, or a duplicate won elsewhere)
+		// but the bytes were already on the wire. They're good data; take them.
+		want = n
+		delete(dp.cancelled, k)
+	} else {
 		if dp.unsolicited++; dp.unsolicited > maxUnsolicited {
 			d.dropPeer(dp, "too many unsolicited blocks")
 		}
 		return
 	}
-	if uint32(len(pc.Block)) != req.length {
+	if uint32(len(pc.Block)) != want {
 		d.dropPeer(dp, "block has the wrong length")
 		return
 	}
 
-	delete(dp.inflight, k)
-	dp.timeouts = 0
+	if answered {
+		delete(dp.inflight, k)
+		dp.timeouts = 0 // a late block doesn't prove the peer is responsive
+	}
 	d.tor.downloaded.Add(int64(len(pc.Block)))
+
+	// Other peers may be fetching the same block: duplicates in endgame, or
+	// the re-request that followed a stall (when this is a late arrival).
+	// Outside those cases there's nobody to cancel, so skip the scan.
+	freed := false
+	if d.endgameSeen || !answered {
+		freed = d.cancelElsewhere(dp, k)
+	}
 
 	job := blockJob{p: dp.p, key: dp.key, index: int(pc.Index), begin: int64(pc.Begin), data: pc.Block}
 	select {
@@ -324,6 +368,9 @@ func (d *downloader) onBlock(dp *dlPeer, pc peer.Piece) {
 	}
 
 	d.fill(dp) // refill the slot now, without waiting for hashing
+	if freed {
+		d.fillAll() // peers whose duplicate was cancelled have a free slot
+	}
 }
 
 func (d *downloader) onResult(r blockOutcome) {
@@ -372,6 +419,7 @@ func (d *downloader) onPieceComplete(idx int) {
 	d.picker.Verified(idx)
 	d.tor.pieceVerified(idx)
 	d.pausedUntil = time.Time{} // buffer memory was just freed
+	d.evalEndgame()
 
 	for _, dp := range d.peers {
 		if !dp.p.Has(idx) {
@@ -430,10 +478,15 @@ func (d *downloader) fill(dp *dlPeer) {
 
 	for len(dp.inflight) < d.cfg.Pipeline {
 		if len(dp.queue) == 0 {
-			if !d.nextPiece(dp, now) {
+			if d.nextPiece(dp, now) {
+				continue // the new piece may have contributed no blocks
+			}
+			// Nothing left to assign. In endgame, help with blocks that
+			// other peers are slow to deliver.
+			if !d.endgame || !d.duplicateBlock(dp) {
 				return
 			}
-			continue // the new piece may have contributed no blocks
+			continue
 		}
 
 		b := dp.queue[0]
@@ -487,7 +540,7 @@ func (d *downloader) pause(dur time.Duration) {
 func (d *downloader) abandon(dp *dlPeer, sendCancel bool) {
 	if sendCancel {
 		for k, r := range dp.inflight {
-			_ = dp.p.TrySend(peer.NewCancel(k.index, k.begin, r.length))
+			d.cancelReq(dp, k, r)
 		}
 	}
 	clear(dp.inflight)
@@ -507,8 +560,7 @@ func (d *downloader) dropPiece(dp *dlPeer, idx int) {
 
 	for k, r := range dp.inflight {
 		if int(k.index) == idx {
-			_ = dp.p.TrySend(peer.NewCancel(k.index, k.begin, r.length))
-			delete(dp.inflight, k)
+			d.cancelReq(dp, k, r)
 		}
 	}
 
@@ -522,6 +574,7 @@ func (d *downloader) dropPiece(dp *dlPeer, idx int) {
 // ---- timeouts ----
 
 func (d *downloader) onTick(now time.Time) {
+	d.evalEndgame()
 	released := false
 	for _, dp := range d.peers {
 		if d.expire(dp, now) {
@@ -629,4 +682,147 @@ func (d *downloader) sendBitfield(dp *dlPeer) {
 	if err := dp.p.TrySend(peer.NewBitfieldMessage(bf)); err != nil {
 		slog.Debug("sending bitfield", "peer", dp.key, "error", err)
 	}
+}
+
+// ---- cancelling ----
+
+// cancelReq withdraws one outstanding request: it tells the remote, forgets the
+// request, and remembers it so a block that was already in flight is accepted.
+func (d *downloader) cancelReq(dp *dlPeer, k reqKey, r inflightReq) {
+	_ = dp.p.TrySend(peer.NewCancel(k.index, k.begin, r.length))
+	delete(dp.inflight, k)
+
+	if dp.cancelled == nil {
+		dp.cancelled = make(map[reqKey]uint32)
+	}
+	if len(dp.cancelled) >= maxCancelled {
+		clear(dp.cancelled) // bounded; a peer can't grow this by stalling
+	}
+	dp.cancelled[k] = r.length
+}
+
+// cancelElsewhere withdraws every other peer's claim on block k, which just
+// arrived from "from": outstanding requests are cancelled and queued ones are
+// dropped. It reports whether any peer was affected.
+func (d *downloader) cancelElsewhere(from *dlPeer, k reqKey) bool {
+	piece, blk := int(k.index), int(int64(k.begin)/blockSize)
+	affected := false
+
+	for _, q := range d.peers {
+		if q == from || q.dead {
+			continue
+		}
+		if r, ok := q.inflight[k]; ok {
+			d.cancelReq(q, k, r)
+			affected = true
+		}
+		n := len(q.queue)
+		q.queue = slices.DeleteFunc(q.queue, func(b blockRef) bool {
+			return b.piece == piece && b.block == blk
+		})
+		if len(q.queue) != n {
+			affected = true
+		}
+	}
+	return affected
+}
+
+// ---- endgame ----
+
+// evalEndgame turns endgame mode on or off. It runs on every tick and after
+// every verified piece.
+func (d *downloader) evalEndgame() {
+	on := d.cfg.EndgameBlocks > 0 && d.inEndgame()
+
+	switch {
+	case on && !d.endgame:
+		slog.Info("entering endgame", "piecesLeft", d.lay.numPieces-d.asm.CompleteCount())
+		d.endgameSeen = true
+	case !on && d.endgame:
+		slog.Info("leaving endgame")
+	}
+	d.endgame = on
+}
+
+// inEndgame reports whether every unverified piece is already assigned to a
+// peer and only a few blocks are still missing. A piece nobody owns means
+// ordinary scheduling still has work to hand out, so duplicating would only
+// waste bandwidth.
+func (d *downloader) inEndgame() bool {
+	remaining := d.lay.numPieces - d.asm.CompleteCount()
+	// Every unverified piece is missing at least one block, so this is a cheap
+	// way to rule out most of a download without scanning anything.
+	if remaining <= 0 || remaining > d.cfg.EndgameBlocks {
+		return false
+	}
+	if _, _, unassigned := d.picker.Counts(); unassigned > 0 {
+		return false
+	}
+
+	// Only a handful of pieces remain; cache them so a tick doesn't rescan the
+	// whole torrent. Completion is monotonic, so a length change is the signal.
+	if len(d.tail) != remaining {
+		d.tail = d.tail[:0]
+		for i := 0; i < d.lay.numPieces; i++ {
+			if !d.asm.Has(i) {
+				d.tail = append(d.tail, i)
+			}
+		}
+	}
+	blocks := 0
+	for _, i := range d.tail {
+		blocks += len(d.asm.MissingBlocks(i))
+	}
+	return blocks > 0 && blocks <= d.cfg.EndgameBlocks
+}
+
+// duplicateBlock queues, for dp, a block that other peers hold: either
+// requested from them already or waiting in their queues. It prefers blocks
+// with the fewest requesters, so idle peers spread across the remaining work
+// rather than all chasing the same block, and skips blocks dp's remote lacks
+// or already has at the cap. It reports whether it queued something.
+func (d *downloader) duplicateBlock(dp *dlPeer) bool {
+	requesters := make(map[reqKey]int) // 0 = queued by its owner, not yet requested
+	refs := make(map[reqKey]blockRef)
+
+	for _, q := range d.peers {
+		if q == dp || q.dead {
+			continue
+		}
+		for k := range q.inflight {
+			requesters[k]++
+			refs[k] = blockRef{piece: int(k.index), block: int(int64(k.begin) / blockSize)}
+		}
+		for _, b := range q.queue {
+			k := reqKey{uint32(b.piece), uint32(int64(b.block) * blockSize)}
+			if _, ok := requesters[k]; !ok {
+				requesters[k] = 0
+				refs[k] = b
+			}
+		}
+	}
+
+	// Never duplicate onto ourselves.
+	for k := range dp.inflight {
+		delete(requesters, k)
+	}
+	for _, b := range dp.queue {
+		delete(requesters, reqKey{uint32(b.piece), uint32(int64(b.block) * blockSize)})
+	}
+
+	var best reqKey
+	bestN := -1
+	for k, n := range requesters {
+		if n >= d.cfg.EndgameMaxRequesters || !dp.p.Has(int(k.index)) {
+			continue
+		}
+		if bestN < 0 || n < bestN {
+			best, bestN = k, n
+		}
+	}
+	if bestN < 0 {
+		return false
+	}
+	dp.queue = append(dp.queue, refs[best])
+	return true
 }
