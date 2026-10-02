@@ -26,6 +26,9 @@ var (
 
 	// ErrClosed is returned by senders once the peer's Run loop has exited.
 	ErrClosed = errors.New("peer: connection closed")
+
+	// ErrQueueFull is returned by TrySend when the outbound queue is full.
+	ErrQueueFull = errors.New("peer: send queue full")
 )
 
 type EventKind uint8
@@ -335,16 +338,42 @@ func (p *Peer) writeLoop(ctx context.Context) error {
 }
 
 func (p *Peer) Send(ctx context.Context, m Message) error {
+	if err := checkSend(m); err != nil {
+		return err
+	}
+	return p.enqueue(ctx, m)
+}
+
+// TrySend is Send without blocking: if the queue is full it returns
+// ErrQueueFull and queues nothing. Use it from a loop that must not stall
+// behind one slow peer.
+func (p *Peer) TrySend(m Message) error {
+	if err := checkSend(m); err != nil {
+		return err
+	}
+	select {
+	case <-p.done:
+		return ErrClosed
+	default:
+	}
+	select {
+	case p.out <- m:
+		return nil
+	default:
+		return ErrQueueFull
+	}
+}
+
+// checkSend rejects messages that must go through SetChoking/SetInterested
+// and messages with malformed payloads.
+func checkSend(m Message) error {
 	if !m.KeepAlive {
 		switch m.ID {
 		case MsgChoke, MsgUnchoke, MsgInterested, MsgNotInterested:
 			return fmt.Errorf("peer: send %v via SetChoking/SetInterested", m.ID)
 		}
 	}
-	if err := m.Validate(); err != nil {
-		return err
-	}
-	return p.enqueue(ctx, m)
+	return m.Validate()
 }
 
 func (p *Peer) enqueue(ctx context.Context, m Message) error {
