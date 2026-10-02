@@ -319,6 +319,8 @@ func (d *downloader) onEvent(ev peer.Event) {
 
 	case peer.EventPiece:
 		d.onBlock(dp, ev.Piece)
+	default:
+		panic("unhandled default case")
 	}
 	// Interested, not-interested, request and cancel concern uploading.
 }
@@ -407,6 +409,8 @@ func (d *downloader) onResult(r blockOutcome) {
 			d.onPieceComplete(idx)
 		case PieceCorrupt:
 			d.onCorrupt(idx, r.res.Sources)
+		default:
+			panic("unhandled default case")
 		}
 	}
 
