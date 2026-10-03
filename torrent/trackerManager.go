@@ -19,6 +19,11 @@ const (
 
 	trackerNumWant = 50
 
+	// trackerStagger is how long announce waits on one tracker before also
+	// starting the next. A dead tracker (typically a silent UDP one) would
+	// otherwise cost its whole timeout before the next is even tried.
+	trackerStagger = 3 * time.Second
+
 	trackerRetryBase = 30 * time.Second
 	trackerRetryMax  = 15 * time.Minute
 )
@@ -38,6 +43,7 @@ type trackerManager struct {
 
 	completed atomic.Bool
 	kick      chan struct{}
+	stagger   time.Duration
 }
 
 func newTrackerManager(tor *Torrent, c *Client) (*trackerManager, error) {
@@ -54,6 +60,7 @@ func newTrackerManager(tor *Torrent, c *Client) (*trackerManager, error) {
 		trackerIDs: make(map[tracker.Tracker]string),
 		announced:  make(map[tracker.Tracker]struct{}),
 		kick:       make(chan struct{}, 1),
+		stagger:    trackerStagger,
 	}
 
 	m.sentCompleted = tor.bytesLeft() == 0
@@ -191,36 +198,118 @@ func (m *trackerManager) nextEvent() tracker.Event {
 	}
 }
 
-func (m *trackerManager) announce(ctx context.Context, ev tracker.Event) (tracker.AnnounceResponse, error) {
-	stats := m.tor.transferStats()
-	var errs []error
+// trackerRef locates one tracker in the tier structure.
+type trackerRef struct {
+	tier, idx int
+	tr        tracker.Tracker
+}
 
-	for _, tier := range m.tiers {
+// flatTrackers lists every tracker in preference order: tiers in order, and
+// within a tier its current order (which keeps recent winners first).
+func (m *trackerManager) flatTrackers() []trackerRef {
+	var refs []trackerRef
+	for ti, tier := range m.tiers {
 		for i, tr := range tier {
-			tctx, cancel := context.WithTimeout(ctx, trackerAnnounceTimeout)
-			resp, err := tr.Announce(tctx, m.request(ev, stats, tr))
-			cancel()
-
-			if ctx.Err() != nil {
-				return tracker.AnnounceResponse{}, ctx.Err()
-			}
-			if err != nil {
-				slog.Debug("tracker failed", "tracker", tr.URL(), "error", err)
-				errs = append(errs, err)
-				continue
-			}
-
-			copy(tier[1:i+1], tier[:i])
-			tier[0] = tr
-
-			m.announced[tr] = struct{}{}
-			if resp.TrackerID != "" {
-				m.trackerIDs[tr] = resp.TrackerID
-			}
-			return resp, nil
+			refs = append(refs, trackerRef{tier: ti, idx: i, tr: tr})
 		}
 	}
-	return tracker.AnnounceResponse{}, fmt.Errorf("all trackers failed: %w", errors.Join(errs...))
+	return refs
+}
+
+// announce asks trackers in preference order and returns the first success.
+//
+// Trackers are not tried strictly one after another: if the current one hasn't
+// answered within m.stagger, the next is started alongside it, and a tracker
+// that fails starts the next immediately. A hung tracker therefore delays the
+// announce by one stagger interval instead of a full timeout. The first
+// success wins and the rest are cancelled.
+//
+// This relaxes BEP 12 slightly (a lower tier may be announced to while a
+// higher one is merely slow), which is what other clients do too.
+func (m *trackerManager) announce(ctx context.Context, ev tracker.Event) (tracker.AnnounceResponse, error) {
+	var zero tracker.AnnounceResponse
+
+	stats := m.tor.transferStats()
+	refs := m.flatTrackers()
+
+	actx, cancel := context.WithTimeout(ctx, trackerAnnounceTimeout)
+	defer cancel() // also cancels any announce still in flight when we return
+
+	type result struct {
+		n    int
+		resp tracker.AnnounceResponse
+		err  error
+	}
+	results := make(chan result, len(refs)) // buffered: late finishers never block
+
+	launched, finished := 0, 0
+	inFlight := make([]bool, len(refs))
+	launch := func() {
+		n := launched
+		launched++
+		inFlight[n] = true
+		// Build the request here: m.request reads manager state, which only
+		// this goroutine may touch.
+		req := m.request(ev, stats, refs[n].tr)
+		go func() {
+			resp, err := refs[n].tr.Announce(actx, req)
+			results <- result{n: n, resp: resp, err: err}
+		}()
+	}
+
+	var errs []error
+	launch()
+	stagger := time.NewTimer(m.stagger)
+	defer stagger.Stop()
+
+	for finished < len(refs) {
+		select {
+		case <-ctx.Done():
+			return zero, ctx.Err()
+
+		case <-stagger.C:
+			if launched < len(refs) {
+				launch()
+				stagger.Reset(m.stagger)
+			}
+
+		case r := <-results:
+			finished++
+			inFlight[r.n] = false
+			if r.err == nil {
+				return m.accept(refs, inFlight, r.n, r.resp), nil
+			}
+			slog.Debug("tracker failed", "tracker", refs[r.n].tr.URL(), "error", r.err)
+			errs = append(errs, r.err)
+			if launched < len(refs) {
+				launch()
+				stagger.Reset(m.stagger)
+			}
+		}
+	}
+	return zero, fmt.Errorf("all trackers failed: %w", errors.Join(errs...))
+}
+
+// accept records the winning tracker: it moves to the front of its tier and
+// its tracker ID is kept. Trackers still mid-announce when we moved on are
+// remembered too, since they may have registered us before being cancelled and
+// should hear "stopped" at shutdown.
+func (m *trackerManager) accept(refs []trackerRef, inFlight []bool, win int, resp tracker.AnnounceResponse) tracker.AnnounceResponse {
+	w := refs[win]
+	tier := m.tiers[w.tier]
+	copy(tier[1:w.idx+1], tier[:w.idx])
+	tier[0] = w.tr
+
+	m.announced[w.tr] = struct{}{}
+	if resp.TrackerID != "" {
+		m.trackerIDs[w.tr] = resp.TrackerID
+	}
+	for n, flying := range inFlight {
+		if flying {
+			m.announced[refs[n].tr] = struct{}{}
+		}
+	}
+	return resp
 }
 
 func (m *trackerManager) stop() {
