@@ -26,3 +26,4 @@ The download will automatically start at `~/goTorrent/downloads`
 * Cleanup Code
 * Streamline concurrency
 * Better Error Handling
+* Testcases
