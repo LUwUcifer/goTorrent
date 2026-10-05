@@ -255,6 +255,13 @@ func (d *downloader) Run(ctx context.Context) {
 	d.ctx = ctx
 	defer close(d.stop)
 
+	// Resumed with every piece already verified: nothing will ever call
+	// onPieceComplete, so mark the download done now (seeding).
+	if d.asm.Done() {
+		slog.Info("all pieces already verified; seeding")
+		d.doneOnce.Do(func() { close(d.done) })
+	}
+
 	for range d.cfg.Workers {
 		go d.worker(ctx)
 	}
@@ -419,8 +426,11 @@ func (d *downloader) onResult(r blockOutcome) {
 			d.onPieceComplete(idx)
 		case PieceCorrupt:
 			d.onCorrupt(idx, r.res.Sources)
+		case BlockStored, BlockDuplicate:
+			// Nothing to do: the block was buffered (or we already had it).
+			// fill() below tops up the peer's request pipeline.
 		default:
-			panic("unhandled default case")
+			slog.Error("unexpected block status", "status", r.res.Status, "piece", idx)
 		}
 	}
 
