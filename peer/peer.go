@@ -68,6 +68,11 @@ type Config struct {
 	SendQueue int
 
 	KeepAlive time.Duration
+
+	// OnUpload, if set, is called with the size of each block after it has been
+	// written to the connection. It runs on the write goroutine, so it must not
+	// block. Use it to count uploaded bytes for tracker announces.
+	OnUpload func(n int)
 }
 
 type Peer struct {
@@ -78,6 +83,7 @@ type Peer struct {
 	keepAlive time.Duration
 	idle      time.Duration
 	events    chan<- Event
+	onUpload  func(n int)
 
 	out       chan Message
 	done      chan struct{}
@@ -122,6 +128,7 @@ func New(conn net.Conn, remote Handshake, cfg Config) (*Peer, error) {
 		keepAlive:   ka,
 		idle:        2*ka + 30*time.Second,
 		events:      cfg.Events,
+		onUpload:    cfg.OnUpload,
 		out:         make(chan Message, queue),
 		done:        make(chan struct{}),
 		amChoking:   true,
@@ -331,7 +338,11 @@ func (p *Peer) writeLoop(ctx context.Context) error {
 			return fmt.Errorf("writing %v: %w", m, err)
 		}
 		if m.Is(MsgPiece) {
-			p.up.Add(len(m.Payload) - 8)
+			n := len(m.Payload) - 8
+			p.up.Add(n)
+			if p.onUpload != nil {
+				p.onUpload(n)
+			}
 		}
 		idle.Reset(p.keepAlive)
 	}

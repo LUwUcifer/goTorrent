@@ -23,7 +23,7 @@ type Torrent struct {
 }
 
 func NewTorrent() *Torrent {
-	return &Torrent{peerCh: make(chan []netip.AddrPort, 16)}
+	return &Torrent{peerCh: make(chan []netip.AddrPort, maxTrackers)}
 }
 
 func (tor *Torrent) Peers() <-chan []netip.AddrPort { return tor.peerCh }

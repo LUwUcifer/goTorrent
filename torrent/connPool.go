@@ -353,7 +353,13 @@ func (cp *connPool) start(ctx context.Context, conn net.Conn, theirs peer.Handsh
 	cp.ids[theirs.PeerID] = struct{}{}
 	cp.mu.Unlock()
 
-	p, err := peer.New(conn, theirs, peer.Config{NumPieces: cp.numPieces, Events: cp.dl.Events()})
+	p, err := peer.New(conn, theirs, peer.Config{
+		NumPieces: cp.numPieces,
+		Events:    cp.dl.Events(),
+		// Counted when the block is actually written, so the tracker is never
+		// told about bytes that were queued but never left.
+		OnUpload: func(n int) { cp.tor.uploaded.Add(int64(n)) },
+	})
 	if err == nil {
 		// Before Run, so our bitfield is the first message the peer sends.
 		err = cp.dl.AddPeer(p)
