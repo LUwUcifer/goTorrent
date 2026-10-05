@@ -55,6 +55,12 @@ type downloaderConfig struct {
 
 	Tick    time.Duration // how often timeouts are checked
 	Workers int           // goroutines hashing and writing completed pieces
+
+	// OnUploadEvent receives interested, not-interested, request and cancel
+	// events for live peers: the events that concern uploading. It runs on the
+	// downloader's loop goroutine, so it must not block; hand real work to
+	// another goroutine. Nil ignores them.
+	OnUploadEvent func(peer.Event)
 }
 
 func (c downloaderConfig) withDefaults() downloaderConfig {
@@ -319,10 +325,14 @@ func (d *downloader) onEvent(ev peer.Event) {
 
 	case peer.EventPiece:
 		d.onBlock(dp, ev.Piece)
-	default:
-		panic("unhandled default case")
+
+	case peer.EventInterested, peer.EventNotInterested, peer.EventRequest, peer.EventCancel:
+		// These concern uploading, not downloading. Whatever happens to them,
+		// a remote peer must never be able to crash the loop with one.
+		if d.cfg.OnUploadEvent != nil {
+			d.cfg.OnUploadEvent(ev)
+		}
 	}
-	// Interested, not-interested, request and cancel concern uploading.
 }
 
 func (d *downloader) onBlock(dp *dlPeer, pc peer.Piece) {
